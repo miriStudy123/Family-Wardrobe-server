@@ -1,0 +1,213 @@
+// ============================================================
+// מודל הנתונים — מערכת לניהול ארון בגדים משפחתי
+// ============================================================
+// עקרונות:
+// - כל נתון משויך למשפחה דרך שרשרת קשרים שהשרת אוכף (Family → Child → ...).
+// - פריטי Look ופריטי הבחירה הנוכחית נשמרים בטבלאות קשר עם מפתח זר מורכב
+//   (clothingItemId, childId) → ClothingItem(id, childId). כך מסד הנתונים עצמו
+//   מונע שיוך של פריט השייך לילד אחר.
+// - מפתח ראשי מורכב בטבלאות הקשר מונע כפילויות.
+// - מחיקות מוגדרות כ-Cascade כדי שלא יישארו קשרים יתומים.
+// - סודות (קוד מנהל, קוד ילד, טוקן התחברות) נשמרים כ-hash בלבד.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Gender {
+  boy
+  girl
+}
+
+enum ClothingCategory {
+  shirt
+  trousers
+  skirt
+  dress
+  accessories
+}
+
+enum Season {
+  summer
+  winter
+  all_season
+}
+
+enum Role {
+  admin
+  child
+}
+
+model Family {
+  id                  String   @id @default(uuid())
+  name                String
+  /// שם מנורמל (אותיות קטנות, רווחים מצומצמים) לצורך השוואה בהתחברות
+  nameNormalized      String
+  /// קוד משפחה ייחודי — מזהה ציבורי-למחצה; אינו מספיק לבדו להתחברות
+  familyCode          String   @unique
+  /// hash (bcrypt) של קוד המנהל
+  adminCredentialHash String
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  children Child[]
+  messages Message[]
+  sessions Session[]
+}
+
+model Child {
+  id              String   @id @default(uuid())
+  familyId        String
+  name            String
+  nameNormalized  String
+  gender          Gender
+  /// HMAC של קוד הילד (עם סוד שרת) — משמש לאכיפת ייחודיות הקוד בתוך המשפחה
+  childCodeDigest String
+  /// hash (bcrypt) של קוד הילד — משמש לאימות
+  credentialHash  String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  family           Family            @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  clothingItems    ClothingItem[]
+  outfits          Outfit[]
+  currentSelection CurrentSelection?
+  messages         Message[]
+  sessions         Session[]
+
+  @@unique([familyId, nameNormalized])
+  @@unique([familyId, childCodeDigest])
+  @@unique([id, familyId])
+  @@index([familyId])
+}
+
+model ClothingItem {
+  id                 String           @id @default(uuid())
+  childId            String
+  name               String
+  category           ClothingCategory
+  season             Season
+  isAvailable        Boolean          @default(true)
+  lastStatusChangeAt DateTime         @default(now())
+  imageUrl           String?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+
+  child          Child                  @relation(fields: [childId], references: [id], onDelete: Cascade)
+  selectionItems CurrentSelectionItem[]
+  outfitItems    OutfitItem[]
+
+  @@unique([id, childId])
+  @@index([childId])
+  @@index([childId, isAvailable])
+  @@index([childId, category])
+  @@index([childId, season])
+}
+
+/// הבחירה הנוכחית — אחת לכל ילד, מתאפסת בכל כניסה חדשה ומוצלחת של הילד
+model CurrentSelection {
+  id        String   @id @default(uuid())
+  childId   String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  child Child                  @relation(fields: [childId], references: [id], onDelete: Cascade)
+  items CurrentSelectionItem[]
+
+  @@unique([id, childId])
+}
+
+model CurrentSelectionItem {
+  selectionId    String
+  childId        String
+  clothingItemId String
+  addedAt        DateTime @default(now())
+
+  selection    CurrentSelection @relation(fields: [selectionId, childId], references: [id, childId], onDelete: Cascade)
+  clothingItem ClothingItem     @relation(fields: [clothingItemId, childId], references: [id, childId], onDelete: Cascade)
+
+  @@id([selectionId, clothingItemId])
+  @@index([clothingItemId])
+}
+
+/// Look קבוע ששמר הילד
+model Outfit {
+  id        String   @id @default(uuid())
+  childId   String
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  child Child        @relation(fields: [childId], references: [id], onDelete: Cascade)
+  items OutfitItem[]
+
+  @@unique([id, childId])
+  @@index([childId])
+}
+
+model OutfitItem {
+  outfitId       String
+  childId        String
+  clothingItemId String
+  addedAt        DateTime @default(now())
+
+  outfit       Outfit       @relation(fields: [outfitId, childId], references: [id, childId], onDelete: Cascade)
+  clothingItem ClothingItem @relation(fields: [clothingItemId, childId], references: [id, childId], onDelete: Cascade)
+
+  @@id([outfitId, clothingItemId])
+  @@index([clothingItemId])
+}
+
+/// הודעה פרטית מילד למנהל המשפחה
+model Message {
+  id        String    @id @default(uuid())
+  familyId  String
+  childId   String
+  body      String    @db.VarChar(2000)
+  createdAt DateTime  @default(now())
+  readAt    DateTime?
+
+  family Family @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  // מפתח זר מורכב: הילד השולח חייב להשתייך לאותה משפחה
+  child  Child  @relation(fields: [childId, familyId], references: [id, familyId], onDelete: Cascade)
+
+  @@index([familyId, createdAt])
+  @@index([childId])
+}
+
+// ------------------------------------------------------------
+// תשתית אבטחה (אינה ישויות עסקיות)
+// ------------------------------------------------------------
+
+/// Session מאומת. הטוקן עצמו לא נשמר — רק SHA-256 שלו.
+model Session {
+  id         String   @id @default(uuid())
+  tokenHash  String   @unique
+  role       Role
+  familyId   String
+  childId    String?
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+
+  family Family @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  child  Child? @relation(fields: [childId], references: [id], onDelete: Cascade)
+
+  @@index([familyId])
+  @@index([childId])
+  @@index([expiresAt])
+}
+
+/// מעקב אחר ניסיונות התחברות כושלים לצורך חסימה זמנית
+model LoginThrottle {
+  /// HMAC של זהות ההתחברות (תפקיד + קוד משפחה + שם ילד) — ללא מידע גלוי
+  key           String    @id
+  failedCount   Int       @default(0)
+  firstFailedAt DateTime
+  lockedUntil   DateTime?
+  updatedAt     DateTime  @updatedAt
+}
